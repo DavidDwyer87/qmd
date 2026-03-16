@@ -350,6 +350,94 @@ Intent-aware lex (C++ performance, not sports):
     }
   );
 
+
+  // ---------------------------------------------------------------------------
+  // Tool: symbol_lookup (additive helper for code search)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "symbol_lookup",
+    {
+      title: "Symbol Lookup",
+      description: "Find files mentioning a symbol/function/class name. Additive helper; does not replace query.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        symbol: z.string().describe("Symbol name to lookup (e.g., authenticateUser, AuthService, handleError)"),
+        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
+      },
+    },
+    async ({ symbol, limit }) => {
+      const q = `"${symbol}"`;
+      const results = await store.search({
+        queries: [{ type: "lex", query: q }],
+        collections: defaultCollectionNames.length > 0 ? defaultCollectionNames : undefined,
+        limit,
+      });
+
+      const filtered: SearchResultItem[] = results.map(r => {
+        const { line, snippet } = extractSnippet(r.bestChunk, symbol, 260);
+        return {
+          docid: `#${r.docid}`,
+          file: r.displayPath,
+          title: r.title,
+          score: Math.round(r.score * 100) / 100,
+          context: r.context,
+          snippet: addLineNumbers(snippet, line),
+        };
+      });
+
+      return {
+        content: [{ type: "text", text: formatSearchSummary(filtered, symbol) }],
+        structuredContent: { symbol, results: filtered },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: references (additive helper for symbol references)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "references",
+    {
+      title: "Symbol References",
+      description: "Find likely references of a symbol across files (lexical helper).",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        symbol: z.string().describe("Symbol name to find references for"),
+        limit: z.number().optional().default(20).describe("Max results (default: 20)"),
+      },
+    },
+    async ({ symbol, limit }) => {
+      const queries: ExpandedQuery[] = [
+        { type: "lex", query: `"${symbol}"` },
+      ];
+
+      const results = await store.search({
+        queries,
+        collections: defaultCollectionNames.length > 0 ? defaultCollectionNames : undefined,
+        limit,
+      });
+
+      const filtered = results.map(r => ({
+        docid: `#${r.docid}`,
+        file: r.displayPath,
+        title: r.title,
+        score: Math.round(r.score * 100) / 100,
+      }));
+
+      const lines = [
+        `Found ${filtered.length} reference candidate${filtered.length === 1 ? "" : "s"} for "${symbol}":`,
+        ...filtered.map(r => `${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`),
+      ];
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: { symbol, results: filtered },
+      };
+    }
+  );
+
   // ---------------------------------------------------------------------------
   // Tool: qmd_get (Retrieve document)
   // ---------------------------------------------------------------------------

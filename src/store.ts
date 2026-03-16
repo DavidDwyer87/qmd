@@ -1047,7 +1047,7 @@ export type Store = {
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
   insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
-  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
+  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; modifiedAt: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
@@ -1121,6 +1121,21 @@ export async function reindexCollection(
     const path = handelize(relativeFile);
     seenPaths.add(path);
 
+    const existing = findActiveDocument(db, collectionName, path);
+    let fileModifiedAt = now;
+    try {
+      fileModifiedAt = statSync(filepath).mtime.toISOString();
+    } catch {
+      // Keep fallback timestamp
+    }
+
+    if (existing && existing.modifiedAt === fileModifiedAt) {
+      unchanged++;
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
@@ -1138,15 +1153,14 @@ export async function reindexCollection(
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
 
-    const existing = findActiveDocument(db, collectionName, path);
-
     if (existing) {
       if (existing.hash === hash) {
         if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
+          updateDocumentTitle(db, existing.id, title, fileModifiedAt);
           updated++;
         } else {
-          unchanged++;
+          updateDocumentTitle(db, existing.id, title, fileModifiedAt);
+          updated++;
         }
       } else {
         insertContent(db, hash, content, now);
@@ -2008,11 +2022,11 @@ export function findActiveDocument(
   db: Database,
   collectionName: string,
   path: string
-): { id: number; hash: string; title: string } | null {
+ ): { id: number; hash: string; title: string; modifiedAt: string } | null {
   const row = db.prepare(`
-    SELECT id, hash, title FROM documents
+    SELECT id, hash, title, modified_at as modifiedAt FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  ` ).get(collectionName, path) as { id: number; hash: string; title: string; modifiedAt: string } | undefined;
   return row ?? null;
 }
 
