@@ -1,6 +1,6 @@
-import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { createStore, hybridQuery } from "../../src/store.js";
 
 type EvalQuery = { query: string; expectedTopPath: string };
 
@@ -18,37 +18,45 @@ function percentile(values: number[], p: number): number {
   return sorted[Math.max(0, index)]!;
 }
 
-function runQmd(command: string): string {
-  return execSync(command, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
-}
-
-function runQuery(mode: "hybrid" | "bm25", query: string): { elapsedMs: number; topPath?: string } {
-  const base = `bun src/cli/qmd.ts ${mode === "hybrid" ? "query" : "search"} ${JSON.stringify(query)} --json -n 1`;
+async function runHybrid(query: string): Promise<{ elapsedMs: number; topPath?: string }> {
   const start = performance.now();
-  const out = runQmd(base);
+  const rows = await hybridQuery(store, query, {
+    collection: "eval-code",
+    limit: 1,
+    skipRerank: true,
+  });
   const elapsedMs = performance.now() - start;
-
-  try {
-    const rows = JSON.parse(out) as Array<{ file?: string }>;
-    return { elapsedMs, topPath: rows[0]?.file };
-  } catch {
-    return { elapsedMs, topPath: undefined };
-  }
+  return { elapsedMs, topPath: rows[0]?.file };
 }
 
-function main() {
+function runBm25(query: string): { elapsedMs: number; topPath?: string } {
+  const start = performance.now();
+  const rows = store.searchFTS(query, 1, "eval-code");
+  const elapsedMs = performance.now() - start;
+  return { elapsedMs, topPath: rows[0]?.filepath };
+}
+
+const store = createStore();
+
+async function main() {
   const queryPath = resolve("test/eval-code/queries.json");
   const queries = JSON.parse(readFileSync(queryPath, "utf-8")) as EvalQuery[];
-  const rounds = Number(process.env.QMD_BENCH_ROUNDS ?? "5");
+  const rounds = Number(process.env.QMD_BENCH_ROUNDS ?? "10");
+
+  // warmup
+  for (const item of queries) {
+    await runHybrid(item.query);
+    runBm25(item.query);
+  }
 
   const results: BenchResult[] = [];
 
   for (const item of queries) {
     for (let i = 0; i < rounds; i++) {
-      const hybrid = runQuery("hybrid", item.query);
+      const hybrid = await runHybrid(item.query);
       results.push({ query: item.query, mode: "hybrid", elapsedMs: hybrid.elapsedMs, topPath: hybrid.topPath });
 
-      const bm25 = runQuery("bm25", item.query);
+      const bm25 = runBm25(item.query);
       results.push({ query: item.query, mode: "bm25", elapsedMs: bm25.elapsedMs, topPath: bm25.topPath });
     }
   }
@@ -72,6 +80,12 @@ function main() {
       bm25Pass: p95Bm25 <= 200,
     },
   }, null, 2));
+
+  await store.close();
 }
 
-main();
+main().catch(async (error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  await store.close();
+  process.exit(1);
+});

@@ -8,14 +8,19 @@ This folder contains deterministic fixtures for code-search benchmarking:
 ## Run
 
 1) Add this corpus as a QMD collection and index/embed it.
-2) Run benchmark (defaults to 5 rounds/query):
+2) Set `INDEX_PATH` to the benchmark index sqlite file.
+3) Run benchmark (defaults to 10 rounds/query):
 
 ```bash
-bun test/eval-code/benchmark.ts
+INDEX_PATH=/path/to/index.sqlite bun test/eval-code/benchmark.ts
 ```
 
 Optional:
-- `QMD_BENCH_ROUNDS=10 bun test/eval-code/benchmark.ts`
+- `INDEX_PATH=/path/to/index.sqlite QMD_BENCH_ROUNDS=20 bun test/eval-code/benchmark.ts`
+
+Benchmark mode notes:
+- Hybrid path is measured via `hybridQuery(..., { skipRerank: true })` in-process.
+- BM25 path is measured via `store.searchFTS(...)` in-process.
 
 ## SLO Gate
 
