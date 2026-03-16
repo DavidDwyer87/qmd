@@ -34,7 +34,7 @@ import type {
   ContextMap,
 } from "./collections.js";
 import { getConfiguredVectorBackend, getQdrantRuntimeConfig, type VectorBackend } from "./vector/backend.js";
-import { ensureQdrantCollection, searchQdrant, upsertQdrantPoints } from "./vector/qdrant.js";
+import { deleteQdrantPoints, ensureQdrantCollection, searchQdrant, upsertQdrantPoints } from "./vector/qdrant.js";
 
 // =============================================================================
 // Configuration
@@ -1115,6 +1115,7 @@ export async function reindexCollection(
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
+  const staleHashes = new Set<string>();
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
@@ -1163,6 +1164,7 @@ export async function reindexCollection(
           updated++;
         }
       } else {
+        staleHashes.add(existing.hash);
         insertContent(db, hash, content, now);
         const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
@@ -1187,12 +1189,23 @@ export async function reindexCollection(
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
+      const existingDoc = findActiveDocument(db, collectionName, path);
+      if (existingDoc) staleHashes.add(existingDoc.hash);
       deactivateDocument(db, collectionName, path);
       removed++;
     }
   }
 
-  const orphanedCleaned = cleanupOrphanedContent(db);
+  if (getConfiguredVectorBackend() === "qdrant" && staleHashes.size > 0) {
+    const hashes = Array.from(staleHashes);
+    const placeholders = hashes.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT hash || '_' || seq as hash_seq FROM content_vectors WHERE hash IN (${placeholders})`).all(...hashes) as { hash_seq: string }[];
+    await deleteQdrantPoints(rows.map(r => r.hash_seq), getQdrantRuntimeConfig());
+  }
+
+  const orphanedContent = cleanupOrphanedContent(db);
+  const orphanedVectors = cleanupOrphanedVectors(db);
+  const orphanedCleaned = orphanedContent + orphanedVectors;
 
   return { indexed, updated, unchanged, removed, orphanedCleaned };
 }
@@ -1238,6 +1251,7 @@ type ChunkItem = {
   pos: number;
   tokens: number;
   bytes: number;
+  language: string;
 };
 
 function validatePositiveIntegerOption(name: string, value: number | undefined, fallback: number): number {
@@ -1367,7 +1381,8 @@ export async function generateEmbeddings(
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(doc.body);
+        const language = detectLanguageFromPath(doc.path);
+        const chunks = await chunkDocumentByTokens(doc.body, CHUNK_SIZE_TOKENS, CHUNK_OVERLAP_TOKENS, CHUNK_WINDOW_TOKENS, doc.path);
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
@@ -1378,6 +1393,7 @@ export async function generateEmbeddings(
             pos: chunks[seq]!.pos,
             tokens: chunks[seq]!.tokens,
             bytes: encoder.encode(chunks[seq]!.text).length,
+            language,
           });
         }
       }
@@ -1435,6 +1451,7 @@ export async function generateEmbeddings(
                     seq: chunk.seq,
                     pos: chunk.pos,
                     model,
+                    language: chunk.language,
                   },
                 });
               }
@@ -1460,7 +1477,7 @@ export async function generateEmbeddings(
                     {
                       id: `${chunk.hash}_${chunk.seq}`,
                       vector: result.embedding,
-                      payload: { hash: chunk.hash, seq: chunk.seq, pos: chunk.pos, model },
+                      payload: { hash: chunk.hash, seq: chunk.seq, pos: chunk.pos, model, language: chunk.language },
                     }
                   ], getQdrantRuntimeConfig());
                 }
@@ -1880,22 +1897,7 @@ export function cleanupOrphanedContent(db: Database): number {
  * Returns the number of orphaned embedding chunks deleted.
  */
 export function cleanupOrphanedVectors(db: Database): number {
-  // sqlite-vec may not be loaded (e.g. Bun's bun:sqlite lacks loadExtension).
-  // The vectors_vec virtual table can appear in sqlite_master from a prior
-  // session, but querying it without the vec0 module loaded will crash (#380).
-  if (!isSqliteVecAvailable()) {
-    return 0;
-  }
-
-  // The schema entry can exist even when sqlite-vec itself is unavailable
-  // (for example when reopening a DB without vec0 loaded). In that case,
-  // touching the virtual table throws "no such module: vec0" and cleanup
-  // should degrade gracefully like the rest of the vector features.
-  try {
-    db.prepare(`SELECT 1 FROM vectors_vec LIMIT 0`).get();
-  } catch {
-    return 0;
-  }
+  const backend = getConfiguredVectorBackend();
 
   // Count orphaned vectors first
   const countResult = db.prepare(`
@@ -1909,17 +1911,29 @@ export function cleanupOrphanedVectors(db: Database): number {
     return 0;
   }
 
-  // Delete from vectors_vec first
-  db.exec(`
-    DELETE FROM vectors_vec WHERE hash_seq IN (
-      SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
-      WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-      )
-    )
-  `);
+  if (backend !== "qdrant") {
+    // sqlite-vec may not be loaded (e.g. Bun's bun:sqlite lacks loadExtension).
+    if (!isSqliteVecAvailable()) {
+      return 0;
+    }
 
-  // Delete from content_vectors
+    try {
+      db.prepare(`SELECT 1 FROM vectors_vec LIMIT 0`).get();
+    } catch {
+      return 0;
+    }
+
+    db.exec(`
+      DELETE FROM vectors_vec WHERE hash_seq IN (
+        SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+        WHERE NOT EXISTS (
+          SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        )
+      )
+    `);
+  }
+
+  // Delete orphaned vector metadata regardless of backend
   db.exec(`
     DELETE FROM content_vectors WHERE hash NOT IN (
       SELECT hash FROM documents WHERE active = 1
@@ -1977,6 +1991,63 @@ export function extractTitle(content: string, filename: string): string {
     if (title) return title;
   }
   return filename.replace(/\.[^.]+$/, "").split("/").pop() || filename;
+}
+
+export function detectLanguageFromPath(path: string): string {
+  const ext = path.toLowerCase().split('.').pop() || '';
+  switch (ext) {
+    case 'ts':
+    case 'tsx':
+      return 'typescript';
+    case 'js':
+    case 'jsx':
+    case 'mjs':
+    case 'cjs':
+      return 'javascript';
+    case 'py':
+      return 'python';
+    case 'go':
+      return 'go';
+    case 'java':
+      return 'java';
+    case 'rs':
+      return 'rust';
+    case 'json':
+      return 'json';
+    case 'yaml':
+    case 'yml':
+      return 'yaml';
+    case 'md':
+    case 'mdx':
+      return 'markdown';
+    default:
+      return 'text';
+  }
+}
+
+function getLanguageChunkingProfile(language: string): { avgCharsPerToken: number } {
+  switch (language) {
+    case "typescript":
+      return { avgCharsPerToken: 2.4 };
+    case "javascript":
+      return { avgCharsPerToken: 2.5 };
+    case "python":
+      return { avgCharsPerToken: 2.7 };
+    case "go":
+      return { avgCharsPerToken: 2.4 };
+    case "java":
+      return { avgCharsPerToken: 2.3 };
+    case "rust":
+      return { avgCharsPerToken: 2.2 };
+    case "json":
+      return { avgCharsPerToken: 2.0 };
+    case "yaml":
+      return { avgCharsPerToken: 2.2 };
+    case "markdown":
+      return { avgCharsPerToken: 3.5 };
+    default:
+      return { avgCharsPerToken: 3.0 };
+  }
 }
 
 // =============================================================================
@@ -2149,13 +2220,15 @@ export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
-  windowTokens: number = CHUNK_WINDOW_TOKENS
+  windowTokens: number = CHUNK_WINDOW_TOKENS,
+  filePath?: string
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
 
-  // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
-  // If chunks exceed limit, they'll be re-split with actual ratio
-  const avgCharsPerToken = 3;
+  // Deterministic language-aware chunk profile with fallback.
+  // v1 uses language-specific token-to-char profiles to keep chunk sizing stable.
+  const language = filePath ? detectLanguageFromPath(filePath) : "text";
+  const { avgCharsPerToken } = getLanguageChunkingProfile(language);
   const maxChars = maxTokens * avgCharsPerToken;
   const overlapChars = overlapTokens * avgCharsPerToken;
   const windowChars = windowTokens * avgCharsPerToken;

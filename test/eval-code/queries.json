@@ -1,0 +1,18 @@
+[
+  {
+    "query": "token bucket rate limiter allow function",
+    "expectedTopPath": "corpus/ts/rateLimiter.ts"
+  },
+  {
+    "query": "retry policy exponential backoff jitter",
+    "expectedTopPath": "corpus/ts/retryPolicy.ts"
+  },
+  {
+    "query": "python load json app config",
+    "expectedTopPath": "corpus/python/config_loader.py"
+  },
+  {
+    "query": "cache key helper for user profile",
+    "expectedTopPath": "corpus/python/cache_keys.py"
+  }
+]

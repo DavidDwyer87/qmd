@@ -115,3 +115,15 @@ export async function searchQdrant(vector: number[], limit: number, config?: Qdr
   });
   return data.result || [];
 }
+
+export async function deleteQdrantPoints(ids: string[], config?: QdrantRuntimeConfig): Promise<void> {
+  if (ids.length === 0) return;
+  const cfg = config ?? getQdrantRuntimeConfig();
+  const deleteUrl = new URL(`/collections/${cfg.collection}/points/delete?wait=true`, cfg.url).toString();
+
+  await requestJson(deleteUrl, {
+    method: "POST",
+    headers: headers(cfg),
+    body: JSON.stringify({ points: ids }),
+  });
+}

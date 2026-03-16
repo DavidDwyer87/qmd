@@ -1,12 +1,23 @@
 # Code Search Benchmark Corpus (Phase 1)
 
-This folder is the bootstrap location for code-search benchmark fixtures used to measure:
-- Hybrid query latency (p95)
-- BM25-only fallback latency (p95)
-- Symbol/code retrieval relevance over representative queries
+This folder contains deterministic fixtures for code-search benchmarking:
+- `corpus/ts/*` and `corpus/python/*` sample code files
+- `queries.json` expected top-hit paths
+- `benchmark.ts` latency benchmark runner
 
-Initial Phase 1 action:
-- Add small, deterministic code fixtures for TS/JS and Python
-- Add query list + expected top-hit paths for regression tracking
+## Run
 
-Future phases can expand this corpus by language and repository size.
+1) Add this corpus as a QMD collection and index/embed it.
+2) Run benchmark (defaults to 5 rounds/query):
+
+```bash
+bun test/eval-code/benchmark.ts
+```
+
+Optional:
+- `QMD_BENCH_ROUNDS=10 bun test/eval-code/benchmark.ts`
+
+## SLO Gate
+
+- Hybrid (`qmd query`) p95 <= 400ms
+- BM25-only (`qmd search`) p95 <= 200ms
