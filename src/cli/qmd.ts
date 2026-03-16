@@ -1,5 +1,6 @@
 import { openDatabase } from "../db.js";
 import type { Database } from "../db.js";
+import { getConfiguredVectorBackend } from "../vector/backend.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -321,6 +322,7 @@ async function showStatus(): Promise<void> {
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
   const needsEmbedding = getHashesNeedingEmbedding(db);
+  const vectorBackend = getConfiguredVectorBackend();
 
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -349,6 +351,7 @@ async function showStatus(): Promise<void> {
   console.log(`${c.bold}Documents${c.reset}`);
   console.log(`  Total:    ${totalDocs.count} files indexed`);
   console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  console.log(`  Backend:  ${vectorBackend}`);
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }

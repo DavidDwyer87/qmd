@@ -33,6 +33,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { getConfiguredVectorBackend, type VectorBackend } from "./vector/backend.js";
 
 // =============================================================================
 // Configuration
@@ -1719,6 +1720,7 @@ export type IndexStatus = {
   totalDocuments: number;
   needsEmbedding: number;
   hasVectorIndex: boolean;
+  vectorBackend?: VectorBackend;
   collections: CollectionInfo[];
 };
 
@@ -3496,11 +3498,13 @@ export function getStatus(db: Database): IndexStatus {
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
   const needsEmbedding = getHashesNeedingEmbedding(db);
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  const vectorBackend = getConfiguredVectorBackend();
 
   return {
     totalDocuments: totalDocs,
     needsEmbedding,
     hasVectorIndex: hasVectors,
+    vectorBackend,
     collections,
   };
 }

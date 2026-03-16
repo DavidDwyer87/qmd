@@ -26,6 +26,8 @@ import {
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
+import { getConfiguredVectorBackend } from "../vector/backend.js";
+import { probeQdrantHealth } from "../vector/qdrant.js";
 
 // =============================================================================
 // Types for structured content
@@ -44,6 +46,11 @@ type StatusResult = {
   totalDocuments: number;
   needsEmbedding: number;
   hasVectorIndex: boolean;
+  vectorBackend?: string;
+  vectorHealth?: {
+    ok: boolean;
+    detail: string;
+  };
   collections: {
     name: string;
     path: string | null;
@@ -112,6 +119,9 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   }
 
   // --- Capability gaps ---
+  const vectorBackend = status.vectorBackend || getConfiguredVectorBackend();
+  lines.push(`\nVector backend: ${vectorBackend}`);
+
   if (!status.hasVectorIndex) {
     lines.push("");
     lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
@@ -492,12 +502,20 @@ Intent-aware lex (C++ performance, not sports):
     },
     async () => {
       const status: StatusResult = await store.getStatus();
+      const vectorBackend = status.vectorBackend || getConfiguredVectorBackend();
+
+      let vectorHealth = status.vectorHealth;
+      if (vectorBackend === "qdrant") {
+        vectorHealth = await probeQdrantHealth();
+      }
 
       const summary = [
         `QMD Index Status:`,
         `  Total documents: ${status.totalDocuments}`,
         `  Needs embedding: ${status.needsEmbedding}`,
         `  Vector index: ${status.hasVectorIndex ? 'yes' : 'no'}`,
+        `  Vector backend: ${vectorBackend}`,
+        ...(vectorHealth ? [`  Vector health: ${vectorHealth.ok ? "healthy" : `degraded (${vectorHealth.detail})`}`] : []),
         `  Collections: ${status.collections.length}`,
       ];
 
@@ -507,7 +525,7 @@ Intent-aware lex (C++ performance, not sports):
 
       return {
         content: [{ type: "text", text: summary.join('\n') }],
-        structuredContent: status,
+        structuredContent: { ...status, vectorBackend, ...(vectorHealth ? { vectorHealth } : {}) },
       };
     }
   );
