@@ -33,7 +33,8 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
-import { getConfiguredVectorBackend, type VectorBackend } from "./vector/backend.js";
+import { getConfiguredVectorBackend, getQdrantRuntimeConfig, type VectorBackend } from "./vector/backend.js";
+import { ensureQdrantCollection, searchQdrant, upsertQdrantPoints } from "./vector/qdrant.js";
 
 // =============================================================================
 // Configuration
@@ -43,7 +44,7 @@ const HOME = process.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
-export const DEFAULT_GLOB = "**/*.md";
+export const DEFAULT_GLOB = "**/*.{md,mdx,ts,tsx,js,jsx,mjs,cjs,py,go,java,rs,json,yaml,yml}";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
@@ -961,6 +962,10 @@ export function isSqliteVecAvailable(): boolean {
 }
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
+  const backend = getConfiguredVectorBackend();
+  if (backend === "qdrant") {
+    return;
+  }
   if (!_sqliteVecAvailable) {
     throw new Error("sqlite-vec is not available. Vector operations require a SQLite build with extension loading support.");
   }
@@ -1088,7 +1093,7 @@ export async function reindexCollection(
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build", "target", ".next", ".venv", "venv", "__pycache__", "coverage"];
 
   const allIgnore = [
     ...excludeDirs.map(d => `**/${d}/**`),
@@ -1307,6 +1312,7 @@ export async function generateEmbeddings(
 ): Promise<EmbedResult> {
   const db = store.db;
   const model = options?.model ?? DEFAULT_EMBED_MODEL;
+  const vectorBackend = getConfiguredVectorBackend();
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
@@ -1334,6 +1340,7 @@ export async function generateEmbeddings(
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
+    let qdrantReady = false;
     const BATCH_SIZE = 32;
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
@@ -1376,7 +1383,16 @@ export async function generateEmbeddings(
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
-        store.ensureVecTable(firstResult.embedding.length);
+        if (vectorBackend === "qdrant") {
+          const cfg = getQdrantRuntimeConfig();
+          if (cfg.dimensions && cfg.dimensions !== firstResult.embedding.length) {
+            throw new Error(`Qdrant dimensions mismatch: env=${cfg.dimensions}, embedding=${firstResult.embedding.length}`);
+          }
+          await ensureQdrantCollection(firstResult.embedding.length, cfg);
+          qdrantReady = true;
+        } else {
+          store.ensureVecTable(firstResult.embedding.length);
+        }
         vectorTableInitialized = true;
       }
 
@@ -1390,16 +1406,32 @@ export async function generateEmbeddings(
 
         try {
           const embeddings = await session.embedBatch(texts);
+          const qdrantPoints: { id: string; vector: number[]; payload: Record<string, unknown> }[] = [];
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
               insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              if (vectorBackend === "qdrant") {
+                qdrantPoints.push({
+                  id: `${chunk.hash}_${chunk.seq}`,
+                  vector: embedding.embedding,
+                  payload: {
+                    hash: chunk.hash,
+                    seq: chunk.seq,
+                    pos: chunk.pos,
+                    model,
+                  },
+                });
+              }
               chunksEmbedded++;
             } else {
               errors++;
             }
             batchChunkBytesProcessed += chunk.bytes;
+          }
+          if (vectorBackend === "qdrant" && qdrantReady) {
+            await upsertQdrantPoints(qdrantPoints, getQdrantRuntimeConfig());
           }
         } catch {
           // Batch failed — try individual embeddings as fallback
@@ -1409,6 +1441,15 @@ export async function generateEmbeddings(
               const result = await session.embed(text);
               if (result) {
                 insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                if (vectorBackend === "qdrant" && qdrantReady) {
+                  await upsertQdrantPoints([
+                    {
+                      id: `${chunk.hash}_${chunk.seq}`,
+                      vector: result.embedding,
+                      payload: { hash: chunk.hash, seq: chunk.seq, pos: chunk.pos, model },
+                    }
+                  ], getQdrantRuntimeConfig());
+                }
                 chunksEmbedded++;
               } else {
                 errors++;
@@ -2820,11 +2861,84 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // =============================================================================
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) return [];
+  const backend = getConfiguredVectorBackend();
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
   if (!embedding) return [];
+
+  if (backend === "qdrant") {
+    let qdrantHits: Awaited<ReturnType<typeof searchQdrant>> = [];
+    try {
+      qdrantHits = await searchQdrant(embedding, limit * 3, getQdrantRuntimeConfig());
+    } catch {
+      return [];
+    }
+    if (qdrantHits.length === 0) return [];
+
+    const hashSeqs = qdrantHits.map(hit => String(hit.id));
+    const scoreMap = new Map(hashSeqs.map((id, i) => [id, qdrantHits[i]!.score]));
+
+    const placeholders = hashSeqs.map(() => '?').join(',');
+    let docSql = `
+      SELECT
+        cv.hash || '_' || cv.seq as hash_seq,
+        cv.hash,
+        cv.pos,
+        'qmd://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        content.doc as body
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash AND d.active = 1
+      JOIN content ON content.hash = d.hash
+      WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    `;
+    const params: string[] = [...hashSeqs];
+
+    if (collectionName) {
+      docSql += ` AND d.collection = ?`;
+      params.push(collectionName);
+    }
+
+    const docRows = db.prepare(docSql).all(...params) as {
+      hash_seq: string; hash: string; pos: number; filepath: string;
+      display_path: string; title: string; body: string;
+    }[];
+
+    const seen = new Map<string, { row: typeof docRows[0]; bestScore: number }>();
+    for (const row of docRows) {
+      const score = scoreMap.get(row.hash_seq) ?? 0;
+      const existing = seen.get(row.filepath);
+      if (!existing || score > existing.bestScore) {
+        seen.set(row.filepath, { row, bestScore: score });
+      }
+    }
+
+    return Array.from(seen.values())
+      .sort((a, b) => b.bestScore - a.bestScore)
+      .slice(0, limit)
+      .map(({ row, bestScore }) => {
+        const collection = row.filepath.split('//')[1]?.split('/')[0] || "";
+        return {
+          filepath: row.filepath,
+          displayPath: row.display_path,
+          title: row.title,
+          hash: row.hash,
+          docid: getDocid(row.hash),
+          collectionName: collection,
+          modifiedAt: "",
+          bodyLength: row.body.length,
+          body: row.body,
+          context: getContextForFile(db, row.filepath),
+          score: bestScore,
+          source: "vec" as const,
+          chunkPos: row.pos,
+        };
+      });
+  }
+
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -2840,11 +2954,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   if (vecResults.length === 0) return [];
 
-  // Step 2: Get chunk info and document data
   const hashSeqs = vecResults.map(r => r.hash_seq);
   const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
 
-  // Build query for document lookup
   const placeholders = hashSeqs.map(() => '?').join(',');
   let docSql = `
     SELECT
@@ -2872,7 +2984,6 @@ export async function searchVec(db: Database, query: string, model: string, limi
     display_path: string; title: string; body: string;
   }[];
 
-  // Combine with distances and dedupe by filepath
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
   for (const row of docRows) {
     const distance = distanceMap.get(row.hash_seq) ?? 1;
@@ -2886,19 +2997,19 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .sort((a, b) => a.bestDist - b.bestDist)
     .slice(0, limit)
     .map(({ row, bestDist }) => {
-      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      const collection = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
         filepath: row.filepath,
         displayPath: row.display_path,
         title: row.title,
         hash: row.hash,
         docid: getDocid(row.hash),
-        collectionName,
-        modifiedAt: "",  // Not available in vec query
+        collectionName: collection,
+        modifiedAt: "",
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        score: 1 - bestDist,
         source: "vec" as const,
         chunkPos: row.pos,
       };
@@ -2956,10 +3067,13 @@ export function insertEmbedding(
   embeddedAt: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
   const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
 
-  insertVecStmt.run(hashSeq, embedding);
+  if (getConfiguredVectorBackend() !== "qdrant") {
+    const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+    insertVecStmt.run(hashSeq, embedding);
+  }
+
   insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
 }
 
@@ -3497,8 +3611,10 @@ export function getStatus(db: Database): IndexStatus {
 
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   const vectorBackend = getConfiguredVectorBackend();
+  const hasVectors = vectorBackend === "qdrant"
+    ? ((db.prepare(`SELECT COUNT(*) as c FROM content_vectors`).get() as { c: number }).c > 0)
+    : !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   return {
     totalDocuments: totalDocs,
