@@ -710,6 +710,7 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
   const store = await createStore({ dbPath: getDefaultDbPath() });
+  const bindHost = process.env.QMD_MCP_HOST || "localhost";
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
@@ -937,7 +938,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, bindHost, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -965,7 +966,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  const displayHost = bindHost === "0.0.0.0" ? "localhost" : bindHost;
+  log(`QMD MCP server listening on http://${displayHost}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 
