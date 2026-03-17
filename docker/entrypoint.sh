@@ -13,7 +13,10 @@ if [ -f /config/qmd.env ]; then
   set +a
 fi
 
-mkdir -p "${QMD_CONFIG_DIR:-/data/config}" "${XDG_CACHE_HOME:-/data/cache}"
+mkdir -p \
+  "${QMD_CONFIG_DIR:-/data/config}" \
+  "${XDG_CACHE_HOME:-/data/cache}" \
+  "${XDG_CACHE_HOME:-/data/cache}/qmd"
 
 if [ -f /config/index.yml ]; then
   cp /config/index.yml "${QMD_CONFIG_DIR:-/data/config}/index.yml"
