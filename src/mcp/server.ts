@@ -150,6 +150,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("Retrieval:");
   lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
   lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
+  lines.push("  - `reindex` — re-scan collections and update the index (optional embed step).");
 
   // --- Non-obvious things that prevent mistakes ---
   lines.push("");
@@ -614,6 +615,67 @@ Intent-aware lex (C++ performance, not sports):
       return {
         content: [{ type: "text", text: summary.join('\n') }],
         structuredContent: { ...status, vectorBackend, ...(vectorHealth ? { vectorHealth } : {}) },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: reindex (trigger index update from MCP)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "reindex",
+    {
+      title: "Reindex Collections",
+      description: "Trigger filesystem re-scan and re-indexing for all or selected collections. Optionally run embedding afterwards.",
+      annotations: { readOnlyHint: false, openWorldHint: false },
+      inputSchema: {
+        collections: z.array(z.string()).optional().describe("Optional list of collection names to update. If omitted, updates all collections."),
+        embed: z.boolean().optional().default(false).describe("Run embedding after update (default: false)."),
+        forceEmbed: z.boolean().optional().default(false).describe("When embed=true, force re-embedding of all content (default: false)."),
+      },
+    },
+    async ({ collections, embed, forceEmbed }) => {
+      const updateResult = await store.update({
+        collections: collections && collections.length > 0 ? collections : undefined,
+      });
+
+      let embedResult: Awaited<ReturnType<QMDStore["embed"]>> | null = null;
+      if (embed) {
+        embedResult = await store.embed({ force: forceEmbed });
+      }
+
+      const status = await store.getStatus();
+
+      const lines = [
+        `Reindex complete.`,
+        `  Collections updated: ${updateResult.collections}`,
+        `  Indexed: ${updateResult.indexed}`,
+        `  Updated: ${updateResult.updated}`,
+        `  Unchanged: ${updateResult.unchanged}`,
+        `  Removed: ${updateResult.removed}`,
+        `  Needs embedding: ${updateResult.needsEmbedding}`,
+        ...(embedResult ? [
+          ``,
+          `Embedding run complete.`,
+          `  Docs processed: ${embedResult.docsProcessed}`,
+          `  Chunks embedded: ${embedResult.chunksEmbedded}`,
+          `  Errors: ${embedResult.errors}`,
+          `  Duration ms: ${embedResult.durationMs}`,
+        ] : []),
+        ``,
+        `Current index status:`,
+        `  Total documents: ${status.totalDocuments}`,
+        `  Needs embedding: ${status.needsEmbedding}`,
+      ];
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: {
+          update: updateResult,
+          ...(embedResult ? { embed: embedResult } : {}),
+          status,
+        },
       };
     }
   );
