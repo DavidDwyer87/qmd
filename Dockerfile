@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 ENV NODE_ENV=production \
+    QMD_MCP_PORT=8181 \
     XDG_CACHE_HOME=/data/cache \
     QMD_CONFIG_DIR=/data/config \
     QMD_VECTOR_BACKEND=qdrant \
@@ -42,11 +43,15 @@ COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/bin ./bin
+COPY docker/entrypoint.sh /usr/local/bin/qmd-entrypoint
 
-RUN mkdir -p /data/cache /data/config && chown -R node:node /app /data
+RUN chmod +x /usr/local/bin/qmd-entrypoint \
+  && mkdir -p /data/cache /data/config /config \
+  && chown -R node:node /app /data /config
 
 USER node
 
 EXPOSE 8181
 
+ENTRYPOINT ["/usr/local/bin/qmd-entrypoint"]
 CMD ["node", "dist/cli/qmd.js", "mcp", "--http", "--port", "8181"]
