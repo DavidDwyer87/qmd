@@ -1,0 +1,15 @@
+.git
+.gitignore
+node_modules
+*.md
+!docker/README.md
+src
+test
+docs
+assets
+finetune
+skills
+scripts
+.flake
+flake.nix
+flake.lock
